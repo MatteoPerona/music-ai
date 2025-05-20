@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 import librosa
 from tqdm import tqdm
+import wandb
 
 # Constants
 DATAROOT1 = "student_files/task1_composer_classification/"
@@ -114,8 +115,14 @@ def train_model(train_json_path):
     # Split into train and validation sets
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Train model
-    model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
+    # Train Random Forest with stronger regularization to reduce overfitting
+    model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=5,              # Lower depth to reduce overfitting
+        min_samples_leaf=5,       # Each leaf must have at least 5 samples
+        min_samples_split=10,     # Each split must have at least 10 samples
+        random_state=42
+    )
     model.fit(X_train, y_train)
     
     # Evaluate on validation set
@@ -129,8 +136,13 @@ def train_model(train_json_path):
     print(f"Task 1 training accuracy: {train_acc:.4f}")
     print(f"Task 1 train-val accuracy difference: {train_acc - val_acc:.4f}")
     
+    # Feature importance reporting
+    print("Feature importances:")
+    print(model.feature_importances_)
+    
+    # Suggestion: Use feature importances to prune less important features if overfitting persists
+    
     # Retrain on full dataset
-    model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
     model.fit(X, y)
     return model
 
@@ -368,36 +380,42 @@ class AudioPipeline:
         self.device = device
         self.model = model.to(device)
         self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='max', factor=0.5, patience=2)
         self.criterion = nn.BCELoss()
+        # Initialize wandb
+        wandb.init(project="music-audio-tagging", name="Task3-AudioClassification", reinit=True)
+        wandb.watch(self.model, log="all")
+        self.learning_rate = learning_rate
         
     def train(self, train_loader, val_loader, num_epochs=30):
         best_val_map = 0
         patience = 5
         patience_counter = 0
-        
         for epoch in range(num_epochs):
             self.model.train()
             running_loss = 0.0
-            
             for x, y, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
                 x, y = x.to(self.device), y.to(self.device)
-                
                 self.optimizer.zero_grad()
                 outputs = self.model(x)
                 loss = self.criterion(outputs, y)
                 loss.backward()
                 self.optimizer.step()
-                
                 running_loss += loss.item()
-            
-            # Evaluate on validation set
+            avg_train_loss = running_loss / len(train_loader)
+            # Evaluate on train and validation set for overfitting monitoring
+            train_predictions, train_map = self.evaluate(train_loader)
             val_predictions, val_map = self.evaluate(val_loader)
-            print(f"Epoch {epoch+1} - Loss: {running_loss/len(train_loader):.4f}, Val mAP: {val_map:.4f}")
-            
+            print(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}, Train mAP: {train_map:.4f}, Val mAP: {val_map:.4f}")
+            # Log to wandb
+            wandb.log({
+                "epoch": epoch+1,
+                "train_loss": avg_train_loss,
+                "train_mAP": train_map,
+                "val_mAP": val_map
+            })
             # Learning rate scheduling
             self.scheduler.step(val_map)
-            
             # Save best model
             if val_map > best_val_map:
                 best_val_map = val_map
@@ -405,11 +423,11 @@ class AudioPipeline:
                 patience_counter = 0
             else:
                 patience_counter += 1
-                
             # Early stopping
             if patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch+1}")
                 break
+        wandb.finish()
     
     def evaluate(self, loader, threshold=0.5, outpath=None):
         self.model.eval()
@@ -453,18 +471,20 @@ def run_task3():
     
     # Create datasets
     full_train = AudioDataset(train_data)
-    # Convert test data list to dictionary format
     test_data_dict = {path: [] for path in test_data}
     test_set = AudioDataset(test_data_dict)
     
-    # Split training data into train and validation
-    train_size = int(0.9 * len(full_train))
-    val_size = len(full_train) - train_size
-    train_set, val_set = random_split(full_train, [train_size, val_size])
+    # Split training data into train, validation, and test (e.g., 80/10/10)
+    total_len = len(full_train)
+    train_size = int(0.8 * total_len)
+    val_size = int(0.1 * total_len)
+    test_size = total_len - train_size - val_size
+    train_set, val_set, local_test_set = random_split(full_train, [train_size, val_size, test_size])
     
     # Create data loaders
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+    local_test_loader = DataLoader(local_test_set, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_set, batch_size=BATCH_SIZE)
     
     # Initialize model and pipeline
@@ -477,6 +497,10 @@ def run_task3():
     # Load best model
     model.load_state_dict(torch.load("best_model_task3.pth"))
     
+    # Evaluate on local test set for overfitting check
+    test_preds, test_map = pipeline.evaluate(local_test_loader)
+    print(f"Task 3 local test mAP = {test_map:.4f}")
+    
     # Evaluate on test set
     test_preds, _ = pipeline.evaluate(test_loader, outpath="predictions3.json")
     
@@ -485,26 +509,26 @@ def run_task3():
     print(f"Task 3 training mAP = {train_map:.4f}")
 
 if __name__ == "__main__":
-    # Task 1
-    print("Running Task 1...")
-    model1 = train_model(DATAROOT1 + "/train.json")
-    train_preds1 = predict(model1, DATAROOT1 + "/train.json")
-    test_preds1 = predict(model1, DATAROOT1 + "/test.json", "predictions1.json")
-    with open(DATAROOT1 + "/train.json", 'r') as f:
-        train_labels1 = eval(f.read())
-    acc1 = accuracy(train_labels1, train_preds1)
-    print("Task 1 training accuracy = " + str(acc1))
+    # # Task 1
+    # print("Running Task 1...")
+    # model1 = train_model(DATAROOT1 + "/train.json")
+    # train_preds1 = predict(model1, DATAROOT1 + "/train.json")
+    # test_preds1 = predict(model1, DATAROOT1 + "/test.json", "predictions1.json")
+    # with open(DATAROOT1 + "/train.json", 'r') as f:
+    #     train_labels1 = eval(f.read())
+    # acc1 = accuracy(train_labels1, train_preds1)
+    # print("Task 1 training accuracy = " + str(acc1))
     
-    # Task 2
-    print("\nRunning Task 2...")
-    model2 = train_model_task2(DATAROOT2 + "/train.json")
-    train_preds2 = predict_task2(model2, DATAROOT2 + "/train.json")
-    test_preds2 = predict_task2(model2, DATAROOT2 + "/test.json", "predictions2.json")
-    with open(DATAROOT2 + "/train.json", 'r') as f:
-        train_labels2 = eval(f.read())
-    acc2 = accuracy_task2(train_labels2, train_preds2)
-    print("Task 2 training accuracy = " + str(acc2))
+    # # Task 2
+    # print("\nRunning Task 2...")
+    # model2 = train_model_task2(DATAROOT2 + "/train.json")
+    # train_preds2 = predict_task2(model2, DATAROOT2 + "/train.json")
+    # test_preds2 = predict_task2(model2, DATAROOT2 + "/test.json", "predictions2.json")
+    # with open(DATAROOT2 + "/train.json", 'r') as f:
+    #     train_labels2 = eval(f.read())
+    # acc2 = accuracy_task2(train_labels2, train_preds2)
+    # print("Task 2 training accuracy = " + str(acc2))
     
-    # # Task 3
-    # print("\nRunning Task 3...")
-    # run_task3() 
+    # Task 3
+    print("\nRunning Task 3...")
+    run_task3() 
